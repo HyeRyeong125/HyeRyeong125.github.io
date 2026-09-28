@@ -1,0 +1,93 @@
+"""
+STEP 3: AI 분석 핸들러
+추출된 텍스트를 AI로 분석하여 마감일, 준비물, 일정 추출
+AWS: DynamoDB Streams 이벤트로 트리거 (status == ocr_done)
+     S3 이벤트도 방어적으로 호환 처리 (트리거 방식 변경 대비)
+"""
+from utils.storage import get_document, save_document
+from utils.ai import analyze
+
+
+def handle(event, context=None):
+    """Lambda 진입점 — S3 이벤트 또는 DynamoDB Streams 이벤트에서 doc_id 추출"""
+    for record in event.get('Records', []):
+        doc_id = None
+
+        # 1) S3 이벤트 (ocr-results/{doc_id}.json) — 주 트리거
+        if record.get('eventSource') == 'aws:s3' or 's3' in record:
+            key = record['s3']['object']['key']  # ocr-results/{doc_id}.json
+            doc_id = key.split('/')[-1].rsplit('.', 1)[0]
+
+        # 2) DynamoDB Streams 이벤트 — 권한 부여 시 호환
+        elif record.get('eventName') == 'MODIFY':
+            new_image = record.get('dynamodb', {}).get('NewImage', {})
+            status = new_image.get('status', {}).get('S', '')
+            if status == 'ocr_done':
+                doc_id = new_image.get('doc_id', {}).get('S', '')
+
+        if doc_id:
+            process(doc_id)
+    return {'success': True}
+
+
+def process(doc_id: str) -> dict:
+    """
+    AI 분석 처리
+    반환: { doc_id, status, analysis }
+    """
+    doc = get_document(doc_id)
+    if not doc:
+        return {"success": False, "message": f"문서를 찾을 수 없습니다: {doc_id}"}
+
+    if doc["status"] not in ["ocr_done"]:
+        return {"success": False, "message": f"OCR이 완료되지 않았습니다. 현재 상태: {doc['status']}"}
+
+    doc["status"] = "ai_processing"
+    save_document(doc_id, doc)
+
+    try:
+        raw_text = doc.get("raw_text", "")
+
+        if raw_text == "__UNSUPPORTED__":
+            # 구 바이너리 포맷(.hwp/.doc 등) — 변환 안내
+            result = {
+                "document_type": "지원하지 않는 형식",
+                "summary": "이 파일 형식은 직접 분석할 수 없습니다. PDF, DOCX, HWPX, 이미지(JPG/PNG) 또는 텍스트 파일로 변환 후 다시 업로드해주세요.",
+                "deadlines": [],
+                "required_documents": [],
+                "calendar_events": [],
+            }
+        else:
+            image_path = doc["file_path"] if raw_text == "__IMAGE_FILE__" else None
+            result = analyze(raw_text, image_path)
+
+        doc["analysis"] = result
+        doc["status"] = "done"
+        save_document(doc_id, doc)
+
+        # Slack 출처 문서면 스레드 알림 + 개인 캘린더 등록 (실패해도 분석 성공은 유지)
+        try:
+            from handlers.action_handler import notify_slack_done
+            notify_slack_done(doc)
+        except Exception as e:
+            print(f"[SLACK_NOTIFY_ERROR] {e}")
+
+        # 이메일 가입 유저면 가입 이메일로 완료 알림 (best-effort)
+        try:
+            from utils.notify_email import notify_done as notify_email_done
+            notify_email_done(doc)
+        except Exception as e:
+            print(f"[EMAIL_NOTIFY_ERROR] {e}")
+
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "status": "done",
+            "analysis": result
+        }
+
+    except Exception as e:
+        doc["status"] = "error"
+        doc["error_message"] = str(e)
+        save_document(doc_id, doc)
+        return {"success": False, "message": f"AI 분석 실패: {str(e)}"}
